@@ -1,83 +1,92 @@
 import time
+import re
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from helpers import print_progressBar
-from threading import Thread, Lock
-from googletrans import Translator
+import deepl
+import pysrt
+from tqdm import tqdm
 
-srt_path = "E:\\en-house.of.the.dragon.s01e01.srt"
-dest_path = "E:\\house.of.the.dragon.s01e01.srt"
-delay_milli_seconds = -1000
+from dotenv import load_dotenv
+import os
 
-f = open(srt_path, encoding="utf-8")
-lines_raw = f.read().split('\n\n')
-lines = []
-for line_raw in lines_raw:
-    if len(line_raw.split('\n')) > 2:
-        lines.append(line_raw)
+load_dotenv()
 
-f.close()
+DEEPL_API_KEY = os.getenv("DEEPL_API_KEY")
 
-max_line_index = len(lines)
-line_done_numer = 0
+if not DEEPL_API_KEY:
+    raise ValueError("DEEPL_API_KEY not found in .env")
 
+SRT_PATH = Path(r"E:\test.srt")
+DEST_PATH = Path(r"E:\test2.srt")
 
-def translate_line(line_index, lock):
-    global lines
-    global line_done_numer
-
-    try:
-        line = lines[line_index]
-        line_split = line.split('\n')
-        time_define_arr = line_split[1].split(' --> ')
-        from_time_milli_seconds = time_str_to_milli_seconds(time_define_arr[0])
-        to_time_milli_seconds = time_str_to_milli_seconds(time_define_arr[1])
-        line_split[1] = ' --> '.join([time_milli_seconds_to_str(from_time_milli_seconds + delay_milli_seconds),
-                                      time_milli_seconds_to_str(to_time_milli_seconds + delay_milli_seconds)])
-
-        target_text = line_split[0:2]
-        translated_text = Translator().translate('\n'.join(line_split[2:]), src='en', dest='vi').text
-        target_text.append(translated_text)
-        lines[line_index] = '\n'.join(target_text)
-        lock.acquire()
-        line_done_numer += 1
-        print_progressBar(line_done_numer, max_line_index, prefix='Progress:', suffix='Complete', length=100)
-        lock.release()
-    except Exception as e:
-        print(str(e))
-        translate_line(line_index, lock)
+SOURCE_LANG = "EN"
+TARGET_LANG = "VI"
+MAX_WORKERS = 4
+RETRY_COUNT = 3
+DELAY_SECONDS = 0.2
 
 
-def time_str_to_milli_seconds(time_str):
-    time_str = time_str.replace(',', '.')
-    time_arr = time_str.split(':')
-    time_seconds = float(time_arr[0]) * 60 * 60 + float(time_arr[1]) * 60 + float(time_arr[2])
-    return time_seconds * 1000
+translator = deepl.Translator(DEEPL_API_KEY)
 
 
-def time_milli_seconds_to_str(time_milli_seconds):
-    time_milli_seconds = int(time_milli_seconds)
-    time_seconds = int(time_milli_seconds / 1000)
-    hours = int(time_seconds / 3600)
-    minutes = int((time_seconds % 3600) / 60)
-    seconds = int(time_seconds % 60)
-    milli_seconds = int(time_milli_seconds % 1000)
+def clean_text(text: str) -> str:
+    """Clean subtitle text before translation."""
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("\n", " ")
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
 
-    return f"{hours:02.0f}:{minutes:02.0f}:{seconds:02.0f},{milli_seconds:03.0f}"
+
+def translate_text(text: str) -> str:
+    """Translate text with retry limit."""
+    if not text.strip():
+        return text
+
+    for attempt in range(RETRY_COUNT):
+        try:
+            result = translator.translate_text(
+                text,
+                source_lang=SOURCE_LANG,
+                target_lang=TARGET_LANG,
+            )
+            return result.text.strip()
+        except Exception as e:
+            if attempt == RETRY_COUNT - 1:
+                print(f"Translate failed: {text[:80]}... | Error: {e}")
+                return text
+
+            time.sleep(1 + attempt)
+
+    return text
+
+
+def translate_subtitle(index, sub):
+    """Translate one subtitle block."""
+    original_text = clean_text(sub.text)
+    translated_text = translate_text(original_text)
+
+    time.sleep(DELAY_SECONDS)
+
+    return index, translated_text
+
+
+def main():
+    subs = pysrt.open(str(SRT_PATH), encoding="utf-8")
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [
+            executor.submit(translate_subtitle, index, sub)
+            for index, sub in enumerate(subs)
+        ]
+
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Translating"):
+            index, translated_text = future.result()
+            subs[index].text = translated_text
+
+    subs.save(str(DEST_PATH), encoding="utf-8")
+    print(f"Done: {DEST_PATH}")
 
 
 if __name__ == "__main__":
-    print_progressBar(0, max_line_index, prefix='Progress:', suffix='Complete', length=100)
-    threads = []
-    lock = Lock()
-
-    for index in range(max_line_index):
-        thread = Thread(target=translate_line, args=(index, lock))
-        thread.start()
-        threads.append(thread)
-
-    for thread in threads:
-        thread.join()
-
-    f = open(dest_path, 'w', encoding="utf-8")
-    f.write('\n\n'.join(lines))
-    f.close()
+    main()
